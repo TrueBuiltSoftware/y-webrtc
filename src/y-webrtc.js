@@ -4,7 +4,7 @@ import * as error from 'lib0/error'
 import * as random from 'lib0/random'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
-import { Observable } from 'lib0/observable'
+import { ObservableV2 } from 'lib0/observable'
 import * as logging from 'lib0/logging'
 import * as promise from 'lib0/promise'
 import * as bc from 'lib0/broadcastchannel'
@@ -174,15 +174,20 @@ export class WebrtcConn {
     log('establishing connection to ', logging.BOLD, remotePeerId)
     this.room = room
     this.remotePeerId = remotePeerId
+    this.glareToken = undefined
     this.closed = false
     this.connected = false
     this.synced = false
     /**
-     * @type {any}
+     * @type {import('simple-peer').Instance}
      */
     this.peer = new Peer({ initiator, ...room.provider.peerOpts })
     this.peer.on('signal', signal => {
-      publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', signal })
+      if (this.glareToken === undefined) {
+        // add some randomness to the timestamp of the offer
+        this.glareToken = Date.now() + Math.random()
+      }
+      publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', token: this.glareToken, signal })
     })
     this.peer.on('connect', () => {
       log('connected to ', logging.BOLD, remotePeerId)
@@ -263,7 +268,7 @@ const broadcastRoomMessage = (room, m) => {
  */
 const announceSignalingInfo = room => {
   signalingConns.forEach(conn => {
-    // only subcribe if connection is established, otherwise the conn automatically subscribes to all rooms
+    // only subscribe if connection is established, otherwise the conn automatically subscribes to all rooms
     if (conn.connected) {
       conn.send({ type: 'subscribe', topics: [room.name] })
       if (room.webrtcConns.size < room.provider.maxConns) {
@@ -337,9 +342,9 @@ export class Room {
      * Listens to Yjs updates and sends them to remote peers
      *
      * @param {Uint8Array} update
-     * @param {any} origin
+     * @param {any} _origin
      */
-    this._docUpdateHandler = (update, origin) => {
+    this._docUpdateHandler = (update, _origin) => {
       const encoder = encoding.createEncoder()
       encoding.writeVarUint(encoder, messageSync)
       syncProtocol.writeUpdate(encoder, update)
@@ -349,9 +354,9 @@ export class Room {
      * Listens to Awareness updates and sends them to remote peers
      *
      * @param {any} changed
-     * @param {any} origin
+     * @param {any} _origin
      */
-    this._awarenessUpdateHandler = ({ added, updated, removed }, origin) => {
+    this._awarenessUpdateHandler = ({ added, updated, removed }, _origin) => {
       const changedClients = added.concat(updated).concat(removed)
       const encoderAwareness = encoding.createEncoder()
       encoding.writeVarUint(encoderAwareness, messageAwareness)
@@ -515,6 +520,24 @@ export class SignalingConn extends ws.WebsocketClient {
                 }
                 break
               case 'signal':
+                if (data.signal.type === 'offer') {
+                  const existingConn = webrtcConns.get(data.from)
+                  if (existingConn) {
+                    const remoteToken = data.token
+                    const localToken = existingConn.glareToken
+                    if (localToken && localToken > remoteToken) {
+                      log('offer rejected: ', data.from)
+                      return
+                    }
+                    // if we don't reject the offer, we will be accepting it and answering it
+                    existingConn.glareToken = undefined
+                  }
+                }
+                if (data.signal.type === 'answer') {
+                  log('offer answered by: ', data.from)
+                  const existingConn = webrtcConns.get(data.from)
+                  existingConn.glareToken = undefined
+                }
                 if (data.to === peerId) {
                   map.setIfUndefined(webrtcConns, data.from, () => new WebrtcConn(this, false, data.from, room)).peer.signal(data.signal)
                   emitPeerChange()
@@ -543,13 +566,29 @@ export class SignalingConn extends ws.WebsocketClient {
  * @property {awarenessProtocol.Awareness} [awareness]
  * @property {number} [maxConns]
  * @property {boolean} [filterBcConns]
- * @property {any} [peerOpts]
+ * @property {import('simple-peer').SimplePeer['config']} [peerOpts]
  */
 
 /**
- * @extends Observable<string>
+ * @param {WebrtcProvider} provider
  */
-export class WebrtcProvider extends Observable {
+const emitStatus = provider => {
+  provider.emit('status', [{
+    connected: provider.connected
+  }])
+}
+
+/**
+ * @typedef {Object} WebrtcProviderEvents
+ * @property {function({connected:boolean}):void} WebrtcProviderEvent.status
+ * @property {function({synced:boolean}):void} WebrtcProviderEvent.synced
+ * @property {function({added:Array<string>,removed:Array<string>,webrtcPeers:Array<string>,bcPeers:Array<string>}):void} WebrtcProviderEvent.peers
+ */
+
+/**
+ * @extends ObservableV2<WebrtcProviderEvents>
+ */
+export class WebrtcProvider extends ObservableV2 {
   /**
    * @param {string} roomName
    * @param {Y.Doc} doc
@@ -595,6 +634,7 @@ export class WebrtcProvider extends Observable {
       } else {
         this.room.disconnect()
       }
+      emitStatus(this)
     })
     this.connect()
     this.destroy = this.destroy.bind(this)
@@ -602,6 +642,15 @@ export class WebrtcProvider extends Observable {
   }
 
   /**
+   * Indicates whether the provider is looking for other peers.
+   *
+   * Other peers can be found via signaling servers or via broadcastchannel (cross browser-tab
+   * communication). You never know when you are connected to all peers. You also don't know if
+   * there are other peers. connected doesn't mean that you are connected to any physical peers
+   * working on the same resource as you. It does not change unless you call provider.disconnect()
+   *
+   * `this.on('status', (event) => { console.log(event.connected) })`
+   *
    * @type {boolean}
    */
   get connected () {
@@ -617,6 +666,7 @@ export class WebrtcProvider extends Observable {
     })
     if (this.room) {
       this.room.connect()
+      emitStatus(this)
     }
   }
 
@@ -631,6 +681,7 @@ export class WebrtcProvider extends Observable {
     })
     if (this.room) {
       this.room.disconnect()
+      emitStatus(this)
     }
   }
 
